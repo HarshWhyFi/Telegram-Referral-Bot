@@ -1,0 +1,177 @@
+import telebot
+import sqlite3
+import random
+import string
+
+# Initialize the bot with your token
+bot_token = "YOUR-BOT-TOKEN"  # Replace with your actual bot token
+bot = telebot.TeleBot(bot_token)
+
+# Admin user ID (replace with your actual admin Telegram ID)
+ADMIN_USER_ID = ADMIN ID HERE  # Replace this with your admin user ID
+
+# Connect to SQLite database (or create it if it doesn't exist)
+conn = sqlite3.connect('affiliate_program.db', check_same_thread=False)
+cursor = conn.cursor()
+
+# Create the database tables if they don't exist
+cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    referral_code TEXT,
+                    referred_by INTEGER,
+                    earnings REAL DEFAULT 0.0,
+                    referrals_count INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'Active'
+                )''')
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS referrals (
+                    user_id INTEGER,
+                    referred_user_id INTEGER,
+                    FOREIGN KEY(user_id) REFERENCES users(user_id),
+                    FOREIGN KEY(referred_user_id) REFERENCES users(user_id)
+                )''')
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS payouts (
+                    user_id INTEGER,
+                    amount REAL,
+                    status TEXT,
+                    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(user_id)
+                )''')
+
+conn.commit()
+
+# Helper function to generate a unique referral code
+def generate_referral_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+# Function to get or create a user in the database
+def get_or_create_user(user_id):
+    cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        referral_code = generate_referral_code()
+        cursor.execute("INSERT INTO users (user_id, referral_code) VALUES (?, ?)", (user_id, referral_code))
+        conn.commit()
+        user = (user_id, referral_code, None, 0.0, 0, 'Active')
+    return user
+
+# Function to track a referral
+def track_referral(referral_code, referred_user_id):
+    cursor.execute("SELECT * FROM users WHERE referral_code=?", (referral_code,))
+    referrer = cursor.fetchone()
+    if referrer:
+        referrer_id = referrer[0]
+        cursor.execute("INSERT INTO referrals (user_id, referred_user_id) VALUES (?, ?)", (referrer_id, referred_user_id))
+        cursor.execute("UPDATE users SET earnings = earnings + 10 WHERE user_id=?", (referrer_id,))  # $10 per referral
+        cursor.execute("UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id=?", (referrer_id,))
+        conn.commit()
+        
+        # Check if referrer qualifies for a bonus
+        referrer = get_or_create_user(referrer_id)
+        if referrer[4] % 5 == 0:  # Bonus for every 5 referrals
+            cursor.execute("UPDATE users SET earnings = earnings + 50 WHERE user_id=?", (referrer_id))  # $50 bonus
+            conn.commit()
+            bot.send_message(referrer_id, "Congratulations! You've earned a bonus for 5 referrals!")
+        
+# Command handler for /start
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user_id = message.from_user.id
+    user = get_or_create_user(user_id)
+    referral_code = user[1]
+    bot.reply_to(message, f"Welcome to the affiliate program! Your referral code is: {referral_code}\n\nShare your referral code and earn rewards!")
+
+# Command handler for /join {referral_code}
+@bot.message_handler(commands=['join'])
+def join_affiliate(message):
+    user_id = message.from_user.id
+    referral_code = message.text.split()[1] if len(message.text.split()) > 1 else None
+
+    if referral_code:
+        cursor.execute("SELECT * FROM users WHERE referral_code=?", (referral_code,))
+        referrer = cursor.fetchone()
+        if referrer:
+            user = get_or_create_user(user_id)
+            if user[2] is None:  # Not already referred
+                track_referral(referral_code, user_id)
+                bot.reply_to(message, f"You have successfully joined using referral code: {referral_code}")
+            else:
+                bot.reply_to(message, "You are already part of the affiliate program.")
+        else:
+            bot.reply_to(message, "Invalid referral code.")
+    else:
+        bot.reply_to(message, "Please provide a referral code.")
+
+# Command handler for /earnings
+@bot.message_handler(commands=['earnings'])
+def view_earnings(message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT earnings FROM users WHERE user_id=?", (user_id,))
+    earnings = cursor.fetchone()
+    if earnings:
+        bot.reply_to(message, f"Your current earnings: ${earnings[0]:.2f}")
+    else:
+        bot.reply_to(message, "You haven't joined the affiliate program yet. Use /start to join.")
+
+# Command handler for /my_affiliates
+@bot.message_handler(commands=['my_affiliates'])
+def my_affiliates(message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT referral_code FROM users WHERE user_id=?", (user_id,))
+    user = cursor.fetchone()
+    if user:
+        referral_code = user[0]
+        cursor.execute("SELECT COUNT(*) FROM referrals WHERE user_id=?", (user_id,))
+        referred_count = cursor.fetchone()[0]
+        bot.reply_to(message, f"You have referred {referred_count} users. Your referral code: {referral_code}")
+    else:
+        bot.reply_to(message, "You haven't joined the affiliate program yet. Use /start to join.")
+
+# Command handler for /payout
+@bot.message_handler(commands=['payout'])
+def payout_request(message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT earnings FROM users WHERE user_id=?", (user_id,))
+    earnings = cursor.fetchone()
+    if earnings and earnings[0] >= 100:  # Minimum payout threshold is $100
+        cursor.execute("INSERT INTO payouts (user_id, amount, status) VALUES (?, ?, 'Pending')", (user_id, earnings[0]))
+        cursor.execute("UPDATE users SET earnings = 0 WHERE user_id=?", (user_id,))
+        conn.commit()
+        bot.reply_to(message, "Your payout request has been submitted and is awaiting approval.")
+    else:
+        bot.reply_to(message, "You must have at least $100 in earnings to request a payout.")
+
+# Admin Command to approve payouts
+@bot.message_handler(commands=['approve_payout'])
+def approve_payout(message):
+    if message.from_user.id == ADMIN_USER_ID:
+        cursor.execute("SELECT user_id, amount FROM payouts WHERE status='Pending'")
+        pending_payouts = cursor.fetchall()
+        if pending_payouts:
+            for user_id, amount in pending_payouts:
+                # Approve payout and mark it as completed
+                cursor.execute("UPDATE payouts SET status='Approved' WHERE user_id=? AND amount=?", (user_id, amount))
+                conn.commit()
+                bot.send_message(user_id, f"Your payout of ${amount:.2f} has been approved. You will receive your payment shortly.")
+            bot.reply_to(message, "All pending payouts have been approved.")
+        else:
+            bot.reply_to(message, "No pending payouts.")
+    else:
+        bot.reply_to(message, "You are not authorized to perform this action.")
+
+# Admin Command to view all earnings and users
+@bot.message_handler(commands=['admin_dashboard'])
+def admin_dashboard(message):
+    if message.from_user.id == ADMIN_USER_ID:
+        cursor.execute("SELECT user_id, referral_code, earnings, referrals_count FROM users")
+        users_info = cursor.fetchall()
+        dashboard_message = "Admin Dashboard:\n\n"
+        for user_id, referral_code, earnings, referrals_count in users_info:
+            dashboard_message += f"User {user_id}: Referrals: {referrals_count}, Earnings: ${earnings:.2f}, Referral Code: {referral_code}\n"
+        bot.reply_to(message, dashboard_message)
+    else:
+        bot.reply_to(message, "You are not authorized to view this information.")
+
+# Polling the bot to receive messages
+bot.polling()
